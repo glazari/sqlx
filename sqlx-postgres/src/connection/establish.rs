@@ -17,6 +17,7 @@ use super::PgConnectionInner;
 impl PgConnection {
     pub(crate) async fn establish(options: &PgConnectOptions) -> Result<Self, Error> {
         // Upgrade to TLS if we were asked to and the server supports it
+        tracing::debug!("in PgConnection::establish");
         let mut stream = PgStream::connect(options).await?;
 
         // To begin a session, a frontend opens a connection to the server
@@ -45,11 +46,15 @@ impl PgConnection {
             params.push(("options", options));
         }
 
+        tracing::debug!("Sending Startup msg, params: {:?}", params);
+
         stream.write(Startup {
             username: Some(&options.username),
             database: options.database.as_deref(),
             params: &params,
         })?;
+
+        tracing::debug!("Startup msg written, flushing stream");
 
         stream.flush().await?;
 
@@ -62,11 +67,15 @@ impl PgConnection {
         let mut secret_key = 0;
         let transaction_status;
 
+        let mut receive_loop_rounds = 0;
         loop {
+            receive_loop_rounds += 1;
+            tracing::debug!("establish receive loop round {}", receive_loop_rounds);
             let message = stream.recv().await?;
             match message.format {
                 BackendMessageFormat::Authentication => match message.decode()? {
                     Authentication::Ok => {
+                        tracing::debug!("Authentication::Ok");
                         // the authentication exchange is successfully completed
                         // do nothing; no more information is required to continue
                     }
@@ -74,6 +83,7 @@ impl PgConnection {
                     Authentication::CleartextPassword => {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
+                        tracing::debug!("Authentication::CleartextPassword, sending Password::Cleartext");
 
                         stream
                             .send(Password::Cleartext(
@@ -87,6 +97,7 @@ impl PgConnection {
                         // password (with user name) encrypted via MD5, then encrypted again
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
+                        tracing::debug!("Authentication::Md5Password, sending Password::Md5 with salt");
 
                         stream
                             .send(Password::Md5 {
@@ -98,10 +109,12 @@ impl PgConnection {
                     }
 
                     Authentication::Sasl(body) => {
+                        tracing::debug!("Authentication::Sasl, starting sasl::authenticate");
                         sasl::authenticate(&mut stream, options, body).await?;
                     }
 
                     method => {
+                        tracing::debug!("unsupported authentication method: {:?}", method);
                         return Err(err_protocol!(
                             "unsupported authentication method: {:?}",
                             method
@@ -112,6 +125,7 @@ impl PgConnection {
                 BackendMessageFormat::BackendKeyData => {
                     // provides secret-key data that the frontend must save if it wants to be
                     // able to issue cancel requests later
+                    tracing::debug!("BackendKeyData, decoding");
 
                     let data: BackendKeyData = message.decode()?;
 
@@ -121,12 +135,15 @@ impl PgConnection {
 
                 BackendMessageFormat::ReadyForQuery => {
                     // start-up is completed. The frontend can now issue commands
+                    tracing::debug!("ReadyForQuery, decoding");
                     transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
+                    tracing::debug!("transaction_status: {:?}", transaction_status);
 
                     break;
                 }
 
                 _ => {
+                    tracing::debug!("unexpected message: {:?}", message.format);
                     return Err(err_protocol!(
                         "establish: unexpected message: {:?}",
                         message.format

@@ -350,8 +350,11 @@ impl<DB: Database> PoolInner<DB> {
         let mut tries = 0;
         loop {
             tries += 1;
-            tracing::debug!("attempting to connect try # {tries}");
+            let timeleft = deadline
+                .checked_duration_since(Instant::now());
+            tracing::debug!("attempting to connect try # {tries}, timeleft: {:?}", timeleft);
             let timeout = deadline_as_timeout(deadline)?;
+            tracing::debug!("timeout: {:?}", timeout);
 
             // clone the connect options arc so it can be used without holding the RwLockReadGuard
             // across an async await point
@@ -366,6 +369,7 @@ impl<DB: Database> PoolInner<DB> {
             match crate::rt::timeout(timeout, connect_options.connect()).await {
                 // successfully established connection
                 Ok(Ok(mut raw)) => {
+                    tracing::debug!("connected to database");
                     // See comment on `PoolOptions::after_connect`
                     let meta = PoolConnectionMetadata {
                         age: Duration::ZERO,
@@ -410,7 +414,10 @@ impl<DB: Database> PoolInner<DB> {
                 }
 
                 // timed out
-                Err(_) => return Err(Error::PoolTimedOut),
+                Err(_) => return {
+                    tracing::debug!("timed out while calling connect_options.connect()");
+                    Err(Error::PoolTimedOut)
+                }
             }
 
             // If the connection is refused, wait in exponentially
