@@ -250,7 +250,11 @@ impl<DB: Database> PoolInner<DB> {
         let acquired = crate::rt::timeout(
             self.options.acquire_timeout,
             async {
+                let mut tries = 0;
                 loop {
+                    tries += 1;
+                    tracing::debug!("attempting to acquire connection try # {tries}");
+
                     // Handles the close-event internally
                     let permit = self.acquire_permit().await?;
 
@@ -259,7 +263,13 @@ impl<DB: Database> PoolInner<DB> {
                     let guard = match self.pop_idle(permit) {
 
                         // Then, check that we can use it...
-                        Ok(conn) => match check_idle_conn(conn, &self.options).await {
+                        Ok(conn) => {
+                            tracing::debug!("popped connection from idle queue, checking if it's usable");
+                            let check = check_idle_conn(conn, &self.options).await;
+                            let ok = check.is_ok();
+                            tracing::debug!("check_idle_conn returned {}", if ok {"ok"} else { "err" });
+
+                            match check {
 
                             // All good!
                             Ok(live) => return Ok(live),
@@ -267,8 +277,14 @@ impl<DB: Database> PoolInner<DB> {
                             // if the connection isn't usable for one reason or another,
                             // we get the `DecrementSizeGuard` back to open a new one
                             Err(guard) => guard,
-                        },
-                        Err(permit) => if let Ok(guard) = self.try_increment_size(permit) {
+                        }},
+                        Err(permit) => {
+                            tracing::debug!("no idle connections available, trying to open a new one");
+                            let guard_result = self.try_increment_size(permit);
+                            let ok = guard_result.is_ok();
+                            tracing::debug!("try_increment_size returned {}", if ok {"ok"} else { "err" });
+
+                            if let Ok(guard) = guard_result {
                             // we can open a new connection
                             guard
                         } else {
@@ -281,10 +297,11 @@ impl<DB: Database> PoolInner<DB> {
                             // execute.
                             crate::rt::yield_now().await;
                             continue;
-                        }
+                        }}
                     };
 
                     // Attempt to connect...
+                    tracing::debug!("attempting to connect");
                     return self.connect(deadline, guard).await;
                 }
             }
@@ -330,7 +347,10 @@ impl<DB: Database> PoolInner<DB> {
         let mut backoff = Duration::from_millis(10);
         let max_backoff = deadline_as_timeout(deadline)? / 5;
 
+        let mut tries = 0;
         loop {
+            tries += 1;
+            tracing::debug!("attempting to connect try # {tries}");
             let timeout = deadline_as_timeout(deadline)?;
 
             // clone the connect options arc so it can be used without holding the RwLockReadGuard
@@ -371,14 +391,23 @@ impl<DB: Database> PoolInner<DB> {
                 }
 
                 // an IO error while connecting is assumed to be the system starting up
-                Ok(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionRefused => (),
+                Ok(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tracing::debug!("connection refused Error::Io({:?}), retrying ", e);
+                    ()
+                },
 
                 // We got a transient database error, retry.
-                Ok(Err(Error::Database(error))) if error.is_transient_in_connect_phase() => (),
+                Ok(Err(Error::Database(error))) if error.is_transient_in_connect_phase() => {
+                    tracing::debug!("transient database error {:?}, retrying", error);
+                    ()
+                },
 
                 // Any other error while connection should immediately
                 // terminate and bubble the error up
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    tracing::debug!("Unknown error while connecting {:?}, returning", e);
+                    return Err(e);
+                }
 
                 // timed out
                 Err(_) => return Err(Error::PoolTimedOut),
